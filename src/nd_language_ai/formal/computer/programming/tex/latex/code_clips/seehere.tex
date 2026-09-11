@@ -1,19 +1,23 @@
 \RequirePackage{xurl}
 
 \makeatletter
-\@ifpackageloaded{hyperref}{}{
-    \RequirePackage{hyperref}
-}
-\makeatother
-
-\AtBeginDocument{
+\@ifpackageloaded{hyperref}{
+    % ``colorlinks`` is a load-time option.  Reapplying it through
+    % \hypersetup after hyperref is loaded produces a noisy warning.
     \hypersetup{
-        colorlinks=true,
+        linkcolor=blue,
+        urlcolor=blue,
+        citecolor=blue
+    }
+}{
+    \RequirePackage[colorlinks=true]{hyperref}
+    \hypersetup{
         linkcolor=blue,
         urlcolor=blue,
         citecolor=blue
     }
 }
+\makeatother
 
 % Convert only absolute Linux filesystem paths to file:// URLs.
 % Everything else keeps the old behavior.
