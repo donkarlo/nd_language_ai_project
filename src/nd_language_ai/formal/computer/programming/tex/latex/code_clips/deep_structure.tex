@@ -127,4 +127,15 @@
 \let\subsubsubsection\ndsectionfour
 \let\subsubsubsubsection\ndsectionfive
 
+% A genuine sixth-level heading below the standard \subparagraph.
+% Preserve the standard paragraph/subparagraph numbering hierarchy.
+\newcounter{subsubparagraph}[subparagraph]
+\renewcommand{\thesubsubparagraph}{\thesubparagraph.\arabic{subsubparagraph}}
+\newcommand{\subsubparagraph}{%
+  \@startsection{subsubparagraph}{6}{\z@}%
+    {1.5ex \@plus .5ex \@minus .2ex}%
+    {.5ex \@plus .2ex}%
+    {\normalfont\normalsize\bfseries}}
+\let\l@subsubparagraph\l@subparagraph
+
 \makeatother
