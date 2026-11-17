@@ -27,7 +27,7 @@ class LlamaCppEmbeddingModel(EmbeddingModel):
                 model_path=str(self._model_path),
                 n_ctx=self._context_size,
                 n_batch=self._context_size,
-                n_ubatch=min(512, self._context_size),
+                n_ubatch=self._context_size,
                 embedding=True,
                 verbose=False,
             )

@@ -6,7 +6,7 @@ from nd_language_ai.natural.large_model.rag.retrieval.hybrid_index import Hybrid
 
 
 class PersistentHybridIndex(HybridIndex):
-    _SCHEMA_VERSION = "3"
+    _SCHEMA_VERSION = "4"
 
     def __init__(self, *args, **kwargs):
         self._pending_root = ""
@@ -228,7 +228,7 @@ class PersistentHybridIndex(HybridIndex):
         )
 
         with self._connect() as connection:
-            rows = connection.execute(
+            body_rows = connection.execute(
                 """
                 SELECT
                     bm25(chunks_fts) AS lexical_rank,
@@ -251,15 +251,102 @@ class PersistentHybridIndex(HybridIndex):
                 ),
             ).fetchall()
 
+            path_rows = connection.execute(
+                """
+                WITH matched_files AS (
+                    SELECT
+                        CAST(file_id AS INTEGER) AS file_id,
+                        bm25(files_fts) AS path_rank
+                    FROM files_fts
+                    WHERE files_fts MATCH ?
+                    ORDER BY path_rank ASC
+                    LIMIT ?
+                ),
+                path_chunks AS (
+                    SELECT
+                        matched_files.path_rank,
+                        files.path,
+                        chunks.text,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY files.id
+                            ORDER BY chunks.id
+                        ) AS chunk_number
+                    FROM matched_files
+                    JOIN files
+                        ON files.id = matched_files.file_id
+                    JOIN chunks
+                        ON chunks.file_id = files.id
+                    WHERE files.active = 1
+                      AND files.state = 'cached'
+                )
+                SELECT path_rank, path, text
+                FROM path_chunks
+                WHERE chunk_number <= 2
+                ORDER BY path_rank ASC
+                LIMIT ?
+                """,
+                (
+                    match_expression,
+                    self._candidate_count,
+                    self._candidate_count * 2,
+                ),
+            ).fetchall()
+
+        candidates = {}
+        body_ranks = [float(row[0]) for row in body_rows]
+        best_body_rank = min(body_ranks) if body_ranks else 0.0
+        path_rank_override = best_body_rank - max(
+            0.01,
+            abs(best_body_rank) * 0.25,
+        )
+
+        for lexical_rank, source_path, text in body_rows:
+            key = (str(source_path), str(text))
+            candidates[key] = (float(lexical_rank), False)
+
+        for _, source_path, text in path_rows:
+            source_path = str(source_path)
+            key = (source_path, str(text))
+            folder_names = {
+                part.lower()
+                for part in Path(source_path).parent.parts
+            }
+            folder_match = any(
+                term in folder_names
+                for term in query_terms
+            )
+            if folder_match:
+                previous_rank, _ = candidates.get(
+                    key,
+                    (path_rank_override, False),
+                )
+                candidates[key] = (
+                    min(previous_rank, path_rank_override),
+                    True,
+                )
+            elif key not in candidates:
+                fallback_rank = (
+                    max(body_ranks) + 0.01
+                    if body_ranks
+                    else 0.01
+                )
+                candidates[key] = (fallback_rank, False)
+
+        ranked_candidates = sorted(
+            candidates.items(),
+            key=lambda item: item[1][0],
+        )[: self._candidate_count]
         return [
             (
-                float(lexical_rank),
+                lexical_rank,
                 {
-                    "source_path": str(source_path),
-                    "text": str(text),
+                    "source_path": source_path,
+                    "text": text,
+                    "path_match": "true" if path_match else "false",
                 },
             )
-            for lexical_rank, source_path, text in rows
+            for (source_path, text), (lexical_rank, path_match)
+            in ranked_candidates
         ]
 
     def _initialize_database(self):
@@ -377,6 +464,65 @@ class PersistentHybridIndex(HybridIndex):
                     INSERT INTO chunks_fts(rowid, text)
                     VALUES (new.id, new.text);
                 END
+                """
+            )
+
+            connection.execute(
+                """
+                CREATE VIRTUAL TABLE IF NOT EXISTS files_fts
+                USING fts5(
+                    file_id UNINDEXED,
+                    path,
+                    tokenize = 'unicode61 remove_diacritics 2'
+                )
+                """
+            )
+
+            connection.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS files_ai
+                AFTER INSERT ON files
+                BEGIN
+                    INSERT INTO files_fts(rowid, file_id, path)
+                    VALUES (new.id, new.id, new.path);
+                END
+                """
+            )
+
+            connection.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS files_ad
+                AFTER DELETE ON files
+                BEGIN
+                    DELETE FROM files_fts
+                    WHERE rowid = old.id;
+                END
+                """
+            )
+
+            connection.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS files_au
+                AFTER UPDATE OF path ON files
+                BEGIN
+                    DELETE FROM files_fts
+                    WHERE rowid = old.id;
+                    INSERT INTO files_fts(rowid, file_id, path)
+                    VALUES (new.id, new.id, new.path);
+                END
+                """
+            )
+
+            connection.execute(
+                """
+                INSERT INTO files_fts(rowid, file_id, path)
+                SELECT files.id, files.id, files.path
+                FROM files
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM files_fts
+                    WHERE files_fts.rowid = files.id
+                )
                 """
             )
 
@@ -591,7 +737,7 @@ class PersistentHybridIndex(HybridIndex):
         except sqlite3.DatabaseError:
             schema_version = ""
 
-        if schema_version == self._SCHEMA_VERSION:
+        if schema_version in {self._SCHEMA_VERSION, "3"}:
             return
 
         self._remove_file_if_exists(database_path)

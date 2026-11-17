@@ -129,10 +129,16 @@ class LlamaCppLanguageModel(LanguageModel):
             {
                 "role": "system",
                 "content": (
-                    "You answer questions from supplied document excerpts. "
-                    "Answer directly and concisely. Do not output reasoning, "
-                    "analysis, or <think> tags. If the excerpts are insufficient, "
-                    "say that clearly."
+                    "You answer questions from supplied document excerpts and their metadata. "
+                    "Each excerpt may include source_file and folder_hierarchy labels. "
+                    "Use clear names in those labels as evidence when asked who or what "
+                    "a document concerns, even if its body omits the name. If the answer "
+                    "comes from a file or folder name, say so. If several possible names "
+                    "appear in the matching folder paths, list them instead of choosing "
+                    "one from unrelated body text. Do not invent first names or unsupported "
+                    "details. Answer directly and concisely; do not output "
+                    "reasoning, analysis, or <think> tags. If the excerpts and metadata "
+                    "are insufficient, say that clearly."
                 ),
             },
             {

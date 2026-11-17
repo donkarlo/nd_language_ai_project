@@ -1,7 +1,9 @@
+import re
 import shutil
 import subprocess
 import sys
 import time
+from collections import OrderedDict
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Set, Tuple
 
@@ -20,6 +22,7 @@ FileSignature = Tuple[int, int]
 class RagService:
     _FILE_READ_TIMEOUT_SECONDS = 60.0
     _SUBPROCESS_POLL_SECONDS = 0.10
+    _ANSWER_CACHE_LIMIT = 32
 
     def __init__(
         self,
@@ -37,6 +40,10 @@ class RagService:
         self._top_k = int(top_k)
         self._max_context_chunks = int(max_context_chunks)
         self._index_ready = False
+        self._answer_cache: OrderedDict[
+            Tuple[str, Tuple[str, ...]],
+            Tuple[str, Tuple[str, ...]],
+        ] = OrderedDict()
 
     def build_index(
         self,
@@ -502,14 +509,52 @@ class RagService:
         seen_sources = set()
         for _, chunk in hits[: self._max_context_chunks]:
             source_path = chunk["source_path"]
+            source = Path(source_path)
+            folder_hierarchy = "/".join(source.parent.parts[-8:])
             context_chunks.append(
-                f"source_path: {source_path}\n{chunk['text']}"
+                f"source_file: {source.name}\n"
+                f"folder_hierarchy: {folder_hierarchy}\n"
+                f"document_text:\n{chunk['text']}"
             )
             if source_path not in seen_sources:
                 seen_sources.add(source_path)
                 sources.append(source_path)
         if not context_chunks:
             raise RuntimeError("No relevant document context was found.")
+
+        cache_key = (question, tuple(context_chunks))
+        cached_answer = self._answer_cache.get(cache_key)
+        if cached_answer is not None:
+            self._answer_cache.move_to_end(cache_key)
+            self._report(
+                progress_callback,
+                "Answer RAM cache hit: reused the answer for this question and these exact excerpts.",
+            )
+            if token_callback is not None:
+                token_callback(cached_answer[0])
+            return {
+                "answer": cached_answer[0],
+                "sources": list(cached_answer[1]),
+            }
+
+        path_answer = self._answer_from_folder_names(
+            question,
+            sources,
+            [
+                (chunk["source_path"], chunk["text"])
+                for _, chunk in hits[: self._max_context_chunks]
+            ],
+        )
+        if path_answer is not None:
+            self._report(
+                progress_callback,
+                "Answering from matching folder names...",
+            )
+            if token_callback is not None:
+                token_callback(path_answer)
+            self._answer_cache[cache_key] = (path_answer, tuple(sources))
+            self._answer_cache.move_to_end(cache_key)
+            return {"answer": path_answer, "sources": sources}
 
         self._report(
             progress_callback,
@@ -521,7 +566,160 @@ class RagService:
             token_callback,
             cancel_callback,
         )
+        self._answer_cache[cache_key] = (answer, tuple(sources))
+        self._answer_cache.move_to_end(cache_key)
+        while len(self._answer_cache) > self._ANSWER_CACHE_LIMIT:
+            self._answer_cache.popitem(last=False)
         return {"answer": answer, "sources": sources}
+
+    def _answer_from_folder_names(
+        self,
+        question: str,
+        sources: List[str],
+        document_evidence: List[Tuple[str, str]],
+    ) -> Optional[str]:
+        lowered_question = question.lower()
+        asks_who = bool(
+            re.search(
+                r"\bwho\b|\bwhi\b|\bwer\b|\bname\b|"
+                r"\bwie heißt\b|\bwie heisst\b",
+                lowered_question,
+            )
+        )
+        if not asks_who:
+            return None
+
+        asks_about_dentist = bool(
+            re.search(
+                r"\bdentist\b|\bdental\b|\btooth\b|\bteeth\b|\bzahnarzt\b",
+                lowered_question,
+            )
+        )
+        if asks_about_dentist:
+            text = "\n".join(text for _, text in document_evidence)
+            doctor_names = re.findall(
+                r"\bDr\.?\s+([A-ZÄÖÜ][\wÄÖÜäöüß'-]*(?:\s+[A-ZÄÖÜ][\wÄÖÜäöüß'-]*){0,2})",
+                text,
+            )
+            unique_names = list(dict.fromkeys(doctor_names))
+            full_names = [
+                name
+                for name in unique_names
+                if not any(
+                    other != name and other.lower().endswith(" " + name.lower())
+                    for other in unique_names
+                )
+            ]
+            if len(full_names) == 1:
+                return (
+                    f"The indexed document identifies your dentist as "
+                    f"Dr. {full_names[0]}."
+                )
+            if len(full_names) > 1:
+                formatted = ", ".join(f"Dr. {name}" for name in full_names)
+                return (
+                    f"The indexed documents mention these dentists: {formatted}. "
+                    "They do not establish which one is current."
+                )
+
+        question_terms = set(
+            re.findall(r"\w+", lowered_question, flags=re.UNICODE)
+        )
+        non_person_folders = {
+            "archive", "appointment", "appointments", "bill", "bills",
+            "clinic", "document", "documents", "general", "hospital",
+            "invoice", "invoices", "medical", "misc", "old", "other",
+            "payment", "payments", "problem", "problems", "record",
+            "records", "test", "tests", "treatment", "treatments",
+            "xray", "x-rays",
+        }
+        names = set()
+
+        for source_path in sources:
+            folder_parts = Path(source_path).parent.parts
+            for index, folder_name in enumerate(folder_parts[:-1]):
+                if folder_name.lower() not in question_terms:
+                    continue
+                person_folder = folder_parts[index + 1]
+                if person_folder.lower() in non_person_folders:
+                    continue
+                names.add(
+                    person_folder.replace("_", " ").replace("-", " ").title()
+                )
+
+        if not names:
+            return None
+
+        ordered_names = sorted(names)
+        if asks_about_dentist and len(ordered_names) > 1:
+            profile_scores: Dict[str, int] = {}
+            profile_evidence: Dict[str, Set[str]] = {}
+            for source_path, body in document_evidence:
+                parts = Path(source_path).parts
+                category_index = next(
+                    (
+                        index
+                        for index, part in enumerate(parts[:-1])
+                        if part.lower() == "dentist"
+                    ),
+                    None,
+                )
+                if category_index is None or category_index + 1 >= len(parts):
+                    continue
+                candidate = (
+                    parts[category_index + 1]
+                    .replace("_", " ")
+                    .replace("-", " ")
+                    .title()
+                )
+                if candidate not in names:
+                    continue
+                indicators = {
+                    "office hours": r"office[_ ]hours|opening[_ ]hours",
+                    "address": r"\baddress\b|\bstraße\b",
+                    "clinic details": r"\bclinic\b|\bordination\b",
+                    "appointments": r"\bappointment(s)?\b|\btermin(e)?\b",
+                    "contact details": r"\bphone\b|\btelephone\b|\btelefon\b",
+                }
+                matched = {
+                    label
+                    for label, pattern in indicators.items()
+                    if re.search(pattern, body, flags=re.IGNORECASE)
+                }
+                profile_scores[candidate] = (
+                    profile_scores.get(candidate, 0) + len(matched)
+                )
+                profile_evidence.setdefault(candidate, set()).update(matched)
+
+            if profile_scores:
+                best_score = max(profile_scores.values())
+                best_candidates = [
+                    name
+                    for name in ordered_names
+                    if profile_scores.get(name, 0) == best_score
+                ]
+                if best_score > 0 and len(best_candidates) == 1:
+                    best = best_candidates[0]
+                    evidence = ", ".join(sorted(profile_evidence[best]))
+                    return (
+                        f"The strongest dentist record is under {best}: "
+                        f"its indexed file includes {evidence}. "
+                        "Other dentist folders are also present, so the files "
+                        "do not explicitly confirm which dentist is current."
+                    )
+
+        if len(ordered_names) == 1:
+            return (
+                f"The matching folder identifies the person as "
+                f"{ordered_names[0]}."
+            )
+
+        name_list = ", ".join(ordered_names[:-1])
+        name_list += f" and {ordered_names[-1]}"
+        return (
+            f"The indexed files contain records under the folders for "
+            f"{name_list}. They do not establish which person is current."
+        )
 
     def _normalize_extensions(self, extensions: List[str]) -> Set[str]:
         normalized: Set[str] = set()

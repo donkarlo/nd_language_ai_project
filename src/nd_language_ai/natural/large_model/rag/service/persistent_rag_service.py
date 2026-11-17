@@ -15,7 +15,7 @@ from nd_language_ai.natural.large_model.rag.service.rag_service import (
 
 
 class PersistentRagService(RagService):
-    _SCHEMA_VERSION = "3"
+    _SCHEMA_VERSION = "4"
     _SQLITE_CANCEL_PROGRESS_OPCODES = 200
     _DEFAULT_DATABASE_PATH = (
         Path.home()
@@ -76,7 +76,7 @@ class PersistentRagService(RagService):
                     active_extensions = []
 
                 if (
-                    schema_version != cls._SCHEMA_VERSION
+                    schema_version not in {cls._SCHEMA_VERSION, "3"}
                     or active_root != root_path
                     or active_extensions != normalized_extensions
                 ):

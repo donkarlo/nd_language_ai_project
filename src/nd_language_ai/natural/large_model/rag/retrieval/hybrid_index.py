@@ -33,8 +33,10 @@ class HybridIndex:
         )
         self._stop_words = {
             "a", "an", "and", "are", "as", "at", "be", "by", "for", "from",
-            "how", "in", "is", "it", "of", "on", "or", "that", "the", "this",
-            "to", "was", "what", "when", "where", "which", "who", "why", "with",
+            "he", "how", "i", "in", "is", "it", "me", "my", "of", "on", "or",
+            "our", "she", "that", "the", "they", "this", "to", "was", "we",
+            "what", "when", "where", "which", "whi", "who", "why", "with",
+            "you", "your",
         }
         self._initialize_database()
 
@@ -162,7 +164,11 @@ class HybridIndex:
         query_vector = self._embedding_model.embed_one(question).astype(np.float32)
         candidate_chunks = [chunk for _, chunk in lexical_candidates]
         candidate_vectors = self._embedding_model.embed_many(
-            [chunk["text"] for chunk in candidate_chunks], progress_callback
+            [
+                self._candidate_embedding_text(chunk)
+                for chunk in candidate_chunks
+            ],
+            progress_callback,
         ).astype(np.float32)
         query_norm = float(np.linalg.norm(query_vector))
         if query_norm <= 0.0:
@@ -188,6 +194,15 @@ class HybridIndex:
         combined.sort(key=lambda item: item[0], reverse=True)
         return combined[: min(max(1, int(top_k)), len(combined))]
 
+    def _candidate_embedding_text(self, chunk: Dict[str, str]) -> str:
+        source = Path(chunk["source_path"])
+        folders = "/".join(source.parent.parts[-8:])
+        return (
+            f"source_file: {source.name}\n"
+            f"folder_hierarchy: {folders}\n"
+            f"document_text:\n{chunk['text']}"
+        )
+
     def _lexical_candidates(
         self,
         question: str,
@@ -200,7 +215,7 @@ class HybridIndex:
             rows = connection.execute(
                 """
                 SELECT
-                    bm25(chunks_fts, 1.0, 1.0) AS lexical_rank,
+                    bm25(chunks_fts, 2.0, 1.0) AS lexical_rank,
                     c.source_path,
                     c.text
                 FROM chunks_fts

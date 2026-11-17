@@ -1,3 +1,4 @@
+import re
 import time
 from collections import OrderedDict
 from typing import Dict, List, Tuple
@@ -18,7 +19,7 @@ class TimedPersistentHybridIndex(PersistentHybridIndex):
     def __init__(self, *args, **kwargs) -> None:
         self._retrieval_cache: OrderedDict[
             Tuple[str, int],
-            Tuple[Tuple[float, str, str], ...],
+            Tuple[Tuple[float, str, str, str], ...],
         ] = OrderedDict()
         self._last_search_timings: Dict[str, float] = {}
         super().__init__(*args, **kwargs)
@@ -66,6 +67,31 @@ class TimedPersistentHybridIndex(PersistentHybridIndex):
                 "Try a more specific term that appears in the documents."
             )
 
+        if self._is_identity_question(question):
+            folder_hits = [
+                (score, chunk)
+                for score, chunk in lexical_candidates
+                if chunk.get("path_match") == "true"
+            ]
+            if folder_hits:
+                result = folder_hits[: min(max(1, int(top_k)), len(folder_hits))]
+                total_seconds = time.perf_counter() - total_started_at
+                self._last_search_timings = {
+                    "retrieval_cache_hit": 0.0,
+                    "folder_metadata_shortcut": 1.0,
+                    "lexical_seconds": lexical_seconds,
+                    "query_embedding_seconds": 0.0,
+                    "candidate_embedding_seconds": 0.0,
+                    "scoring_seconds": 0.0,
+                    "retrieval_total_seconds": total_seconds,
+                }
+                self._report(
+                    progress_callback,
+                    "Using exact folder-name matches for the identity question.",
+                )
+                self._remember_retrieval(cache_key, result)
+                return result
+
         query_embedding_started_at = time.perf_counter()
         self._report(progress_callback, "Embedding the question...")
         query_vector = self._embedding_model.embed_one(question).astype(np.float32)
@@ -82,7 +108,10 @@ class TimedPersistentHybridIndex(PersistentHybridIndex):
             f"Embedding {len(candidate_chunks)} retrieval candidates...",
         )
         candidate_vectors = self._embedding_model.embed_many(
-            [chunk["text"] for chunk in candidate_chunks],
+            [
+                self._candidate_embedding_text(chunk)
+                for chunk in candidate_chunks
+            ],
             progress_callback,
         ).astype(np.float32)
         candidate_embedding_seconds = (
@@ -128,10 +157,16 @@ class TimedPersistentHybridIndex(PersistentHybridIndex):
             semantic_normalized = (
                 float(semantic_scores[candidate_position]) + 1.0
             ) / 2.0
-            final_score = (
-                0.35 * lexical_normalized
-                + 0.65 * semantic_normalized
-            )
+            if chunk.get("path_match") == "true":
+                final_score = (
+                    0.60 * lexical_normalized
+                    + 0.40 * semantic_normalized
+                )
+            else:
+                final_score = (
+                    0.35 * lexical_normalized
+                    + 0.65 * semantic_normalized
+                )
             combined.append((final_score, chunk))
 
         combined.sort(key=lambda item: item[0], reverse=True)
@@ -157,6 +192,16 @@ class TimedPersistentHybridIndex(PersistentHybridIndex):
 
         self._remember_retrieval(cache_key, result)
         return result
+
+    @staticmethod
+    def _is_identity_question(question: str) -> bool:
+        return bool(
+            re.search(
+                r"\bwho\b|\bwhi\b|\bwer\b|\bname\b|"
+                r"\bwie heißt\b|\bwie heisst\b",
+                question.lower(),
+            )
+        )
 
     def last_search_timings(self) -> Dict[str, float]:
         return dict(self._last_search_timings)
@@ -207,6 +252,7 @@ class TimedPersistentHybridIndex(PersistentHybridIndex):
                 float(score),
                 str(chunk["source_path"]),
                 str(chunk["text"]),
+                str(chunk.get("path_match", "false")),
             )
             for score, chunk in hits
         )
@@ -217,7 +263,7 @@ class TimedPersistentHybridIndex(PersistentHybridIndex):
 
     def _restore_cached_hits(
         self,
-        cached: Tuple[Tuple[float, str, str], ...],
+        cached: Tuple[Tuple[float, str, str, str], ...],
     ) -> List[Tuple[float, Dict[str, str]]]:
         return [
             (
@@ -225,9 +271,10 @@ class TimedPersistentHybridIndex(PersistentHybridIndex):
                 {
                     "source_path": source_path,
                     "text": text,
+                    "path_match": path_match,
                 },
             )
-            for score, source_path, text in cached
+            for score, source_path, text, path_match in cached
         ]
 
     def _clear_retrieval_cache(self) -> None:
